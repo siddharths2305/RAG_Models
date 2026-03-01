@@ -378,8 +378,7 @@ print("✅ Index loaded!")
 
 ## 📄 License
 
-This project is open for academic and educational use.
-
+License ka koi scene nhi apna samaj ke use krna aur han kch aur add krna ho toh bta dena bss siddh448@gmail.com
 ---
 
 *Built with LangChain · HuggingFace · FAISS · Google Flan-T5*
