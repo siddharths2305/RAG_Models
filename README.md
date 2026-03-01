@@ -1,3 +1,225 @@
+# 🏛️ Sanskrit RAG System — Architecture Document
+
+## Overview
+
+This document describes the complete technical architecture of the **Sanskrit Retrieval-Augmented Generation (RAG) System** — an end-to-end pipeline for ingesting Sanskrit documents and answering natural language queries from their content using CPU-based inference.
+
+---
+
+## System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        USER INTERFACE (Colab)                       │
+│                   Input: Sanskrit / English / IAST query            │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DOCUMENT INGESTION LAYER                        │
+│                                                                     │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
+│   │  TextLoader  │    │ PyPDFLoader  │    │  UTF-8 Encoding      │  │
+│   │  (.txt files)│    │ (.pdf files) │    │  (Devanagari support)│  │
+│   └──────┬───────┘    └──────┬───────┘    └──────────────────────┘  │
+│          └──────────┬────────┘                                      │
+│                     ▼                                               │
+│        ┌────────────────────────┐                                   │
+│        │ RecursiveCharacter     │  chunk_size=500                   │
+│        │    TextSplitter        │  chunk_overlap=50                 │
+│        │ Separators: । \n\n \n │  (Sanskrit-aware)                 │
+│        └────────────┬───────────┘                                   │
+└─────────────────────┼───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      EMBEDDING LAYER                                │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │     HuggingFaceEmbeddings                                    │  │
+│   │     Model: paraphrase-multilingual-MiniLM-L12-v2            │  │
+│   │     Device: CPU  │  Output: 384-dimensional vectors          │  │
+│   └──────────────────────────────┬───────────────────────────────┘  │
+│                                  │                                  │
+│                    Text → [0.23, -0.81, 0.45 ...]                  │
+└──────────────────────────────────┼──────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       VECTOR STORE (FAISS)                          │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │  FAISS Index (CPU)                                           │  │
+│   │  - Stores all chunk embeddings                               │  │
+│   │  - Similarity search: cosine / L2 distance                  │  │
+│   │  - Persisted locally: sanskrit_faiss_index/                 │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │
+              ┌────────────────────┘
+              │   At Query Time: top-k=3 similar chunks retrieved
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        RETRIEVAL LAYER                              │
+│                                                                     │
+│   Query → Embed → FAISS Search → Top-3 Relevant Chunks             │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │  Prompt Construction                                         │  │
+│   │                                                              │  │
+│   │  "Answer the question based on context below.               │  │
+│   │   Context: {retrieved_chunks}                               │  │
+│   │   Question: {user_query}                                    │  │
+│   │   Answer:"                                                  │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     GENERATION LAYER (LLM)                          │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │  Model: google/flan-t5-base                                  │  │
+│   │  Task: text2text-generation                                  │  │
+│   │  Device: CPU  │  max_new_tokens: 200                         │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│                     Generated Answer (text)                         │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌──────────────────┐
+                        │   Final Answer   │
+                        │  Displayed to    │
+                        │     User         │
+                        └──────────────────┘
+```
+
+---
+
+## Component Breakdown
+
+### 1. Document Ingestion Layer
+
+| Component | Library | Purpose |
+|---|---|---|
+| `TextLoader` | `langchain-community` | Loads `.txt` files with UTF-8 encoding for Devanagari |
+| `PyPDFLoader` | `langchain-community` + `pypdf` | Extracts text from PDF documents |
+| `RecursiveCharacterTextSplitter` | `langchain-text-splitters` | Splits documents into overlapping chunks |
+
+**Chunking Strategy:**
+- Chunk size: `500` characters
+- Overlap: `50` characters
+- Separators (in priority order): `।` → `\n\n` → `\n` → ` `
+- The `।` (daṇḍa) separator ensures Sanskrit sentences are not split mid-meaning
+
+---
+
+### 2. Embedding Layer
+
+| Component | Model | Dimensions | Languages |
+|---|---|---|---|
+| `HuggingFaceEmbeddings` | `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 50+ including Sanskrit, Hindi, English |
+
+- Converts each text chunk into a 384-dimensional numerical vector
+- Similar meaning → similar vectors (cosine similarity)
+- Runs entirely on CPU with no GPU requirement
+
+---
+
+### 3. Vector Store
+
+| Component | Library | Storage |
+|---|---|---|
+| `FAISS` | `langchain-community` + `faiss-cpu` | Local disk (`sanskrit_faiss_index/`) |
+
+- Facebook AI Similarity Search — optimized for fast nearest-neighbour lookup
+- At query time, retrieves top-`k` (default: 3) most semantically similar chunks
+- Index is saved to disk and can be reloaded without reprocessing documents
+
+---
+
+### 4. Generation Layer (LLM)
+
+| Component | Model | Task | Device |
+|---|---|---|---|
+| `pipeline` | `google/flan-t5-base` | `text2text-generation` | CPU |
+
+- Flan-T5 is instruction-tuned by Google — good at following directives
+- Receives: system instructions + retrieved context + user question
+- Outputs: natural language answer grounded in the retrieved Sanskrit text
+
+**Upgrade Path:**
+
+```
+flan-t5-base (fast, ~250MB)
+      ↓
+flan-t5-large (better quality, ~800MB)
+      ↓
+flan-t5-xl (best quality, ~3GB, still CPU-compatible)
+```
+
+---
+
+## Data Flow Summary
+
+```
+Document Upload
+      ↓
+Load (TextLoader / PyPDFLoader)
+      ↓
+Split into Chunks (RecursiveCharacterTextSplitter)
+      ↓
+Embed Chunks → Vectors (HuggingFaceEmbeddings)
+      ↓
+Store in FAISS Index
+      ↓
+[Query Time]
+User Query → Embed → Search FAISS → Retrieve Top-3 Chunks
+      ↓
+Build Prompt (Instructions + Context + Question)
+      ↓
+Generate Answer (Flan-T5)
+      ↓
+Display Answer to User
+```
+
+---
+
+## Technology Stack
+
+| Layer | Technology | Version |
+|---|---|---|
+| Framework | LangChain | latest |
+| Document Loaders | langchain-community | latest |
+| Text Splitting | langchain-text-splitters | latest |
+| Embeddings | langchain-huggingface | latest |
+| Vector Store | FAISS (CPU) | faiss-cpu |
+| Embedding Model | sentence-transformers | paraphrase-multilingual-MiniLM-L12-v2 |
+| LLM | HuggingFace Transformers | google/flan-t5-base |
+| PDF Support | pypdf | latest |
+| Environment | Google Colab | Python 3.10+ |
+
+---
+
+## Design Decisions
+
+**Why CPU-only?**
+The system is designed to run without GPU access, making it accessible on free Google Colab tiers and standard laptops.
+
+**Why multilingual embeddings?**
+Sanskrit text in Devanagari script and IAST transliteration both need to be understood semantically. The `paraphrase-multilingual-MiniLM-L12-v2` model handles both.
+
+**Why Flan-T5?**
+It is instruction-tuned (follows directions well), lightweight enough for CPU, free to use, and produces coherent answers when given structured prompts.
+
+**Why FAISS over other vector stores?**
+FAISS is local, requires no server setup, no API keys, and no internet connection at query time — ideal for a self-contained Colab notebook.
+
+**Why `।` as a separator?**
+The daṇḍa (`।`) is the Sanskrit sentence-ending punctuation equivalent to a period. Using it as a primary split boundary preserves grammatical and semantic units in the chunks.
+
 # 🪷 Sanskrit RAG System
 
 > A Retrieval-Augmented Generation (RAG) pipeline for querying Sanskrit documents using CPU-based inference — no GPU required.
@@ -35,130 +257,6 @@ Copy the cells below **one by one** into Colab and run them in order using `Shif
 
 ---
 
-## 📓 Full Notebook — Cell by Cell
-
-### Cell 1 — Install Dependencies
-```python
-!pip install -q langchain langchain-community langchain-text-splitters \
-             langchain-huggingface sentence-transformers faiss-cpu \
-             transformers pypdf accelerate
-```
-
-### Cell 2 — Upload Your Sanskrit Documents
-```python
-from google.colab import files
-
-print("Upload your .txt or .pdf Sanskrit documents")
-uploaded = files.upload()
-
-doc_files = list(uploaded.keys())
-print(f"Uploaded: {doc_files}")
-```
-
-### Cell 3 — Load & Preprocess Documents
-```python
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-docs = []
-
-for fname in doc_files:
-    if fname.endswith(".pdf"):
-        loader = PyPDFLoader(fname)
-    else:
-        loader = TextLoader(fname, encoding="utf-8")
-    docs.extend(loader.load())
-
-print(f"Loaded {len(docs)} document(s)")
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    separators=["।", "\n\n", "\n", " "]
-)
-chunks = splitter.split_documents(docs)
-print(f"Total chunks: {len(chunks)}")
-```
-
-### Cell 4 — Create Embeddings & FAISS Index
-```python
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-
-print("Loading embedding model (CPU)...")
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    model_kwargs={"device": "cpu"}
-)
-
-print("Building FAISS index...")
-vectorstore = FAISS.from_documents(chunks, embeddings)
-vectorstore.save_local("sanskrit_faiss_index")
-print("✅ Index saved!")
-```
-
-### Cell 5 — Load CPU-based LLM
-```python
-from transformers import pipeline
-
-print("Loading LLM (this may take a minute)...")
-llm_pipeline = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base",
-    device=-1
-)
-print("✅ LLM ready!")
-```
-
-### Cell 6 — Build the RAG Query Function
-```python
-def retrieve_and_answer(query: str, top_k: int = 3):
-    print(f"\n🔍 Query: {query}\n")
-
-    retriever = vectorstore.as_retriever(search_kwargs={"k": top_k})
-    relevant_docs = retriever.invoke(query)
-
-    context = "\n\n".join([doc.page_content for doc in relevant_docs])
-    print("📄 Retrieved Context:\n", context[:600], "...\n")
-
-    prompt = f"""Answer the question based on the Sanskrit text context below.
-
-Context:
-{context}
-
-Question: {query}
-Answer:"""
-
-    result = llm_pipeline(prompt, max_new_tokens=200, truncation=True)
-    answer = result[0]["generated_text"]
-
-    print("💬 Answer:\n", answer)
-    return answer
-```
-
-### Cell 7 — Run Sample Queries
-```python
-retrieve_and_answer("Who is Shankhanaada and what mistake did he make?")
-```
-```python
-retrieve_and_answer("What is the moral of the story about the devotee?")
-```
-```python
-retrieve_and_answer("What did kAlidAsa do when the foreign scholar arrived?")
-```
-
-### Cell 8 — Interactive Query Loop
-```python
-print("🪷 Sanskrit RAG System Ready! Type 'quit' to exit.\n")
-
-while True:
-    query = input("Enter your query (Sanskrit / English / Transliterated): ")
-    if query.lower() == "quit":
-        break
-    retrieve_and_answer(query)
-```
-
----
 
 ## 📁 Project Structure
 
